@@ -1,0 +1,48 @@
+<!doctype html><meta charset="utf-8"><title>spike1</title>
+<p>Pick a still (png/jpg/webp, ideally ≥1080p). It's stretched to 1920×1080. Animated files give frame 1 only.<br>
+<input type="file" id="f" accept="image/*"> <button id="alpha">alpha test</button></p>
+<pre id="out"></pre>
+<script src="common.js"></script>
+<script>
+const W = 1920, H = 1080;
+async function fourcc(blob) {
+  const u8 = new Uint8Array(await blob.slice(0, 32).arrayBuffer());
+  return String.fromCharCode(...u8.subarray(12, 16)); // VP8L = lossless, 'VP8 ' = lossy, VP8X = extended
+}
+onFile('#f', async f => {
+  const bmp = await createImageBitmap(f);
+  log('source', bmp.width + 'x' + bmp.height);
+  const c = mkCanvas(W, H), x = ctx2d(c); x.drawImage(bmp, 0, 0, W, H);
+  const src = x.getImageData(0, 0, W, H);
+  const c2 = mkCanvas(W, H), x2 = ctx2d(c2);
+  for (const [type, q] of [['image/webp', 1.0], ['image/webp', 0.99], ['image/webp', undefined], ['image/png', undefined]]) {
+    const ts = []; let blob;
+    for (let i = 0; i < 5; i++) { const t = performance.now(); blob = await toBlob(c, type, q); ts.push(performance.now() - t); }
+    const ds = []; let rt;
+    for (let i = 0; i < 3; i++) {
+      const t = performance.now();
+      const b = await createImageBitmap(blob, { colorSpaceConversion: 'none' });
+      x2.clearRect(0, 0, W, H); x2.drawImage(b, 0, 0); rt = x2.getImageData(0, 0, W, H);
+      ds.push(performance.now() - t); b.close();
+    }
+    log(type, 'q=' + q, '| chunk', await fourcc(blob), '| size', fmtB(blob.size),
+        '\n   encode ms', stats(ts), '\n   decode+draw+readback ms', stats(ds), '\n   roundtrip vs source', cmpRGBA(src, rt));
+  }
+});
+$('#alpha').onclick = async () => {
+  // 256x1 strip: alpha = 0..255, straight RGB (200,100,50). Does canvas premultiplication destroy info?
+  const id = new ImageData(256, 1);
+  for (let i = 0; i < 256; i++) id.data.set([200, 100, 50, i], i * 4);
+  const c = mkCanvas(256, 1), x = ctx2d(c); x.putImageData(id, 0, 0);
+  const rb = x.getImageData(0, 0, 256, 1);
+  const blob = await toBlob(c, 'image/webp', 1.0);
+  const bmp = await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+  const c2 = mkCanvas(256, 1), x2 = ctx2d(c2); x2.drawImage(bmp, 0, 0);
+  const rt = x2.getImageData(0, 0, 256, 1);
+  log('--- alpha test, chunk', await fourcc(blob));
+  for (const a of [0, 1, 2, 5, 64, 128, 254, 255])
+    log('alpha', a, 'put', [...id.data.subarray(a*4, a*4+4)], 'canvas readback', [...rb.data.subarray(a*4, a*4+4)], 'after webp', [...rt.data.subarray(a*4, a*4+4)]);
+  log('canvas readback vs put (premult loss):', cmpRGBA(id, rb));
+  log('webp roundtrip vs canvas readback:', cmpRGBA(rb, rt));
+};
+</script>

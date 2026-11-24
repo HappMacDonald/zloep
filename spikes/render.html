@@ -1,0 +1,200 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>renderFrame spike</title>
+<style>
+  body { font: 14px system-ui; margin: 16px; background: #222; color: #ddd }
+  canvas { background: repeating-conic-gradient(#999 0 25%, #bbb 0 50%) 0 0 / 16px 16px; max-width: 100%; border: 1px solid #555 }
+  pre, #log { background: #111; padding: 8px; white-space: pre-wrap; font: 13px Consolas, monospace }
+  .ok { color: #6c6 } .bad { color: #f66 } .info { color: #9cf }
+</style>
+<input type="file" id="file" accept=".webp,image/webp">
+<button id="run" disabled>Run checks</button>
+<button id="play" disabled>Play / Pause</button>
+<br><input type="range" id="scrub" min="0" max="0" value="0" style="width:600px"> <span id="lbl"></span>
+<br><canvas id="cv"></canvas>
+<div id="log"></div>
+
+<script type="module">
+import { sha256hex } from '../lib/util.js';
+import { createFrameSource } from '../lib/framesource.js';
+import { createGeneratedCache } from '../lib/textraster.js';
+import { renderFrame, prepareFrame, tryPrepareFrame, drawFrame } from '../engine/render.js';
+import { validateProject } from '../engine/project.js';
+import { checkEnv, canvasProbe } from '../lib/env.js';
+
+const $ = id => document.getElementById(id);
+const log = (m, c = '') => { const d = document.createElement('div'); d.className = c; d.textContent = m; $('log').append(d); };
+const check = (name, ok, extra = '') => log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + extra : ''}`, ok ? 'ok' : 'bad');
+const mkCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+const pixels = c => c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+const ndiff = (a, b) => { let n = a.length === b.length ? 0 : Infinity; for (let i = 0; i < a.length && n !== Infinity; i++) if (a[i] !== b[i]) n++; return n; };
+
+let S = null;   // {file, hash, project, frames, gen, env, W, H, total, starts}
+
+try { log('checkEnv: ' + JSON.stringify(await checkEnv()), 'info'); } catch (e) { log('checkEnv threw: ' + e.message, 'bad'); }
+try { log('canvasProbe: ' + JSON.stringify(await canvasProbe()), 'info'); } catch (e) { log('canvasProbe threw: ' + e.message, 'bad'); }
+
+$('file').onchange = async e => { const f = e.target.files[0]; if (f) { try { await load(f); } catch (err) { log('load failed: ' + (err.stack || err), 'bad'); } } };
+
+async function load(file) {
+  $('log').textContent = ''; stop();
+  const type = file.type || 'image/webp';
+  const hash = await sha256hex(file);
+  const frames = createFrameSource({ maxBytes: 256 * 1024 * 1024 });
+  frames.addMedia(hash, file, type);
+  const info = await frames.info(hash);
+  log(`${file.name}: ${info.frameCount} frames, animated=${info.animated}`, 'info');
+
+  const t0 = performance.now(); const durs = []; let W = 0, H = 0;
+  for (let i = 0; i < info.frameCount; i++) {
+    const l = await frames.acquire(hash, i);
+    if (!l) { log('decode failed at frame ' + i, 'bad'); return; }
+    W = l.image.displayWidth; H = l.image.displayHeight; durs.push(l.image.duration); l.release();
+  }
+  log(`decoded all frames in ${(performance.now() - t0).toFixed(0)} ms; ${W}x${H}; frame0 duration µs=${durs[0]}`, 'info');
+
+  const seq = durs.map((us, i) => ({ sourceFrame: i, durationTicks: Math.max(1, Math.round((us ?? 100000) / 1000)) }));
+  const total = seq.reduce((a, f) => a + f.durationTicks, 0);
+  const starts = []; { let a = 0; for (const f of seq) { starts.push(a); a += f.durationTicks; } }
+  const project = {
+    version: 1, idSeq: 4,
+    media: [{ sha256: hash, name: file.name, size: file.size, type, dimensions: [W, H], frameCount: info.frameCount }],
+    settings: { width: W, height: H, fps: [10, 1], tickRate: 1000, crop: null, dilation: [1, 1],
+                output: { loop: 0, minDelayMs: 20, keyframeInterval: 0 } },
+    clips: [
+      { id: 'c1', kind: 'sequence', mediaHash: hash, frames: seq, start: 0, x: 0, y: 0, alpha: 1 },
+      { id: 'c2', kind: 'rect', start: Math.floor(total / 4), duration: Math.floor(total / 2), x: 10, y: 10,
+        width: Math.round(W / 3), height: Math.round(H / 4), fill: '#ff0000', alpha: 0.5 },
+      { id: 'c3', kind: 'text', start: 0, duration: total, x: 20, y: Math.round(H / 2),
+        text: 'Hello, wörld\nsecond line', fontFamily: 'Arial', fontSize: Math.max(16, Math.round(H / 8)), fontWeight: 700,
+        fill: '#ffffff', outline: { color: '#000000', width: 6 }, shadow: { color: 'rgba(0,0,0,0.6)', blur: 6, dx: 3, dy: 3 }, alpha: 1 },
+    ],
+  };
+  const v = validateProject(project);
+  log(`validateProject: ${v.errors.length} errors, ${v.warnings.length} warnings ${v.errors.concat(v.warnings).join(' | ')}`, v.errors.length ? 'bad' : 'info');
+
+  const gen = createGeneratedCache({ makeCanvas: mkCanvas });
+  S = { file, type, hash, project, frames, gen, env: { frames, generated: gen }, W, H, total, starts };
+  $('cv').width = W; $('cv').height = H;
+  $('scrub').max = total - 1; $('scrub').value = 0;
+  $('run').disabled = false; $('play').disabled = false;
+  await show(0);
+  log('Loaded. Scrub, press Play, or Run checks.', 'info');
+}
+
+// ---------- preview ----------
+let showToken = 0;
+async function show(tick) {
+  const my = ++showToken;
+  const p = tryPrepareFrame(S.project, tick, S.env) ?? await prepareFrame(S.project, tick, S.env);
+  if (my !== showToken) { p.release(); return; }
+  drawFrame($('cv').getContext('2d'), p, { width: S.W, height: S.H });
+  p.release();
+  $('lbl').textContent = `tick ${tick} / ${S.total}`;
+}
+$('scrub').oninput = e => { stop(); show(+e.target.value); };
+
+let playing = false, t0 = 0, pending = false, stalls = 0, drawn = 0;
+function stop() { if (playing) { playing = false; log(`played: ${drawn} draws, ${stalls} stalls (cache not ready)`, 'info'); } }
+$('play').onclick = () => {
+  if (playing) return stop();
+  playing = true; t0 = performance.now() - (+$('scrub').value); stalls = 0; drawn = 0; requestAnimationFrame(loop);
+};
+function loop(now) {
+  if (!playing) return;
+  const tick = Math.floor(now - t0) % S.total;            // tickRate is 1000 in this spike
+  const p = tryPrepareFrame(S.project, tick, S.env);
+  if (p) { drawFrame($('cv').getContext('2d'), p, { width: S.W, height: S.H }); p.release(); drawn++; $('scrub').value = tick; $('lbl').textContent = `tick ${tick} / ${S.total}`; }
+  else stalls++;
+  if (!pending) {                                          // warm: current if stalled, else 200 ticks ahead
+    const target = p ? (tick + 200) % S.total : tick;
+    const probe = p ? tryPrepareFrame(S.project, target, S.env) : null;
+    if (probe) probe.release();
+    else { pending = true; prepareFrame(S.project, target, S.env).then(q => q.release()).catch(e => log('warm: ' + e.message, 'bad')).finally(() => { pending = false; }); }
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------- checks ----------
+$('run').onclick = async () => { stop(); try { await runChecks(); } catch (e) { log('checks threw: ' + (e.stack || e), 'bad'); } };
+
+async function runChecks() {
+  const { project, env, frames, gen, W, H, starts, total, file, type } = S;
+  const seqOnly = { ...project, clips: [project.clips[0]] };
+  const buf = await file.arrayBuffer();
+  const dec = new ImageDecoder({ data: buf, type }); await dec.tracks.ready; await dec.completed;
+  const refCache = new Map();
+  const reference = async i => {
+    if (!refCache.has(i)) {
+      const { image } = await dec.decode({ frameIndex: i });
+      const c = mkCanvas(W, H); c.getContext('2d').drawImage(image, 0, 0); image.close();
+      refCache.set(i, pixels(c));
+    }
+    return refCache.get(i);
+  };
+  const render = async (proj, tick, e = env) => { const c = mkCanvas(W, H); const r = await renderFrame(c.getContext('2d'), proj, tick, e); return { c, r }; };
+  const n = starts.length;
+  const sample = [...new Set([0, 1, 2, Math.floor(n / 2), n - 1].filter(i => i >= 0 && i < n))];
+
+  // A. sequence-only render == plain decoder drawImage
+  let bad = 0;
+  for (const i of sample) { const { c } = await render(seqOnly, starts[i]); bad += ndiff(pixels(c), await reference(i)); }
+  check('A. sequence-only renderFrame is pixel-identical to direct decode+drawImage', bad === 0, `frames ${sample.join(',')}, differing bytes=${bad}`);
+
+  // B. determinism across paths (cold text cache -> warm, prepare+draw path)
+  const T = Math.floor(total / 3) + 1;
+  gen.clear();
+  const a1 = pixels((await render(project, T)).c);
+  const a2 = pixels((await render(project, T)).c);
+  const p = tryPrepareFrame(project, T, env); const c3 = mkCanvas(W, H);
+  drawFrame(c3.getContext('2d'), p, { width: W, height: H }); p.release();
+  check('B. full composite identical cold/warm and via tryPrepare+drawFrame', ndiff(a1, a2) === 0 && ndiff(a1, pixels(c3)) === 0, `at tick ${T}`);
+
+  // C. caption moves/fades/retimes reuse the bitmap; text edits do not
+  const e0 = gen.stats().entries;
+  const moved = { ...project, clips: project.clips.map(c => c.kind === 'text' ? { ...c, x: c.x + 13, y: c.y + 7, alpha: 0.5, start: 1 } : c) };
+  await render(moved, T);
+  check('C1. move/alpha/start change reuses the text bitmap', gen.stats().entries === e0, `entries ${e0} -> ${gen.stats().entries}`);
+  const edited = { ...project, clips: project.clips.map(c => c.kind === 'text' ? { ...c, text: 'other' } : c) };
+  await render(edited, T);
+  check('C2. text edit makes a new bitmap', gen.stats().entries === e0 + 1, `entries now ${gen.stats().entries}`);
+
+  // D. tiny cache + concurrent renders: leases keep frames alive, cache trims afterwards
+  const small = createFrameSource({ maxBytes: W * H * 4 * 2 });
+  small.addMedia(S.hash, file, type);
+  const senv = { frames: small, generated: gen };
+  const idxs = sample.slice(0, 8);
+  const results = await Promise.all(idxs.map(i => render(seqOnly, starts[i], senv)));
+  let dbad = 0; for (let k = 0; k < idxs.length; k++) dbad += ndiff(pixels(results[k].c), await reference(idxs[k]));
+  for (let i = 0; i < n; i++) await render(seqOnly, starts[i], senv);          // sequential sweep forces eviction
+  const ss = small.stats();
+  check('D1. concurrent renders under a 2-frame budget are still exact', dbad === 0, `differing bytes=${dbad}`);
+  check('D2. after sweep: nothing pinned, within budget, no decode errors', ss.pinned === 0 && ss.bytes <= ss.maxBytes && ss.errors === 0, JSON.stringify(ss));
+  await small.dispose();
+
+  // E. missing / out-of-range
+  const weird = { ...project,
+    clips: [...project.clips,
+      { ...project.clips[0], id: 'c8', mediaHash: 'deadbeef' },
+      { ...project.clips[0], id: 'c9', frames: [{ sourceFrame: project.media[0].frameCount + 5, durationTicks: total }] }] };
+  const w = (await render(weird, T)).r;
+  check('E. missing media and out-of-range frames are reported, not thrown', w.missing.join() === 'deadbeef' && w.outOfRange.join() === 'c9', JSON.stringify(w));
+
+  // F. leaks
+  const fs = frames.stats(), gs = gen.stats();
+  check('F. no leaked leases', fs.pinned === 0 && gs.pinned === 0, `frames ${JSON.stringify(fs)} | text ${JSON.stringify(gs)}`);
+
+  // G. (Q6) does toBlob snapshot the canvas at call time?
+  const c = mkCanvas(8, 8), x = c.getContext('2d');
+  x.fillStyle = '#f00'; x.fillRect(0, 0, 8, 8);
+  const pr = new Promise(r => c.toBlob(r, 'image/webp', 1.0));
+  x.fillStyle = '#00f'; x.fillRect(0, 0, 8, 8);                 // mutate right after calling
+  const bmp = await createImageBitmap(await pr);
+  const c2 = mkCanvas(8, 8); c2.getContext('2d').drawImage(bmp, 0, 0);
+  const d = c2.getContext('2d').getImageData(4, 4, 1, 1).data;
+  log(`G. toBlob result pixel rgb=(${d[0]},${d[1]},${d[2]}) -> ${d[0] > 200 && d[2] < 50 ? 'SNAPSHOT at call time' : d[2] > 200 && d[0] < 50 ? 'reads canvas LATER (not a snapshot!)' : 'unexpected'}`, 'info');
+
+  dec.close();
+  log('checks done.', 'info');
+}
+</script>

@@ -1,0 +1,95 @@
+<!doctype html><meta charset="utf-8"><title>spike4</title>
+<p>Open via <b>file://</b> and via <b>http://localhost</b> and compare.<br>
+Gesture-required tests:
+<button id="fsa">showOpenFilePicker</button>
+<button id="dir">showDirectoryPicker</button>
+<button id="fonts">queryLocalFonts + FontFace local()</button>
+<input type="file" id="f"> (ImageDecoder on a picked file)</p>
+<pre id="out"></pre>
+
+<!-- classic script: expect OK everywhere -->
+<script src="classic.js"></script>
+<!-- module script: expected to fail on file:// -->
+<script>window.__modEvt = 'pending';</script>
+<script type="module" src="mod.js" onload="__modEvt='load'" onerror="__modEvt='error'"></script>
+
+<script>
+const out = $ => document.getElementById('out');
+const log = (...a) => out().textContent += a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') + '\n';
+const attempt = async (name, fn) => {
+  try { log('OK  ', name, '→', await fn()); }
+  catch (e) { log('FAIL', name, '→', e && e.name + ': ' + e.message); }
+};
+
+window.addEventListener('load', async () => {
+  log('UA', navigator.userAgent); 
+  log('href', location.href, '| origin', location.origin, '| isSecureContext', isSecureContext);
+  log('classic script ran:', !!window.__classic);
+  await new Promise(r => setTimeout(r, 300));
+  log('module <script src>: window.__mod =', !!window.__mod, ', event =', window.__modEvt);
+  await attempt('dynamic import(./mod.js)', async () => (await import('./mod.js')).x);
+
+  await attempt('crypto.subtle.digest', async () => {
+    const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('abc'));
+    return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16) + ' (want ba7816bf8f01cfea)';
+  });
+
+  log('typeof ImageDecoder', typeof ImageDecoder);
+  if (typeof ImageDecoder !== 'undefined')
+    for (const t of ['image/webp', 'image/gif', 'image/png', 'image/apng', 'image/jpeg'])
+      await attempt('ImageDecoder.isTypeSupported ' + t, () => ImageDecoder.isTypeSupported(t));
+
+  await attempt('canvas toBlob webp', async () => {
+    const c = document.createElement('canvas'); c.width = c.height = 8;
+    const b = await new Promise(r => c.toBlob(r, 'image/webp', 1.0));
+    return b.type + ' ' + b.size + ' bytes';
+  });
+
+  log('typeof showOpenFilePicker', typeof window.showOpenFilePicker,
+      '| showDirectoryPicker', typeof window.showDirectoryPicker,
+      '| queryLocalFonts', typeof window.queryLocalFonts,
+      '| navigator.storage.getDirectory', typeof (navigator.storage && navigator.storage.getDirectory));
+
+  await attempt('fetch(common.js)', async () => (await (await fetch('common.js')).text()).length + ' chars');
+  await attempt('fetch(blob: URL)', async () => (await (await fetch(URL.createObjectURL(new Blob(['hi'])))).text()));
+
+  // Worker from file
+  await attempt('new Worker("worker.js")', () => new Promise((res, rej) => {
+    const w = new Worker('worker.js');
+    w.onmessage = e => { res(JSON.stringify(e.data)); w.terminate(); };
+    w.onerror = e => { rej(new Error(e.message || 'worker error event')); };
+    setTimeout(() => rej(new Error('timeout 2s')), 2000);
+  }));
+  // Worker from Blob (possible file:// workaround)
+  await attempt('new Worker(blob:) inline', () => new Promise((res, rej) => {
+    const src = 'postMessage({where:"blob-worker",OffscreenCanvas:typeof OffscreenCanvas,ImageDecoder:typeof ImageDecoder,subtle:!!(self.crypto&&crypto.subtle)})';
+    const w = new Worker(URL.createObjectURL(new Blob([src])));
+    w.onmessage = e => { res(JSON.stringify(e.data)); w.terminate(); };
+    w.onerror = e => rej(new Error(e.message || 'worker error event'));
+    setTimeout(() => rej(new Error('timeout 2s')), 2000);
+  }));
+  log('--- click the buttons for the gesture-required tests ---');
+});
+
+document.getElementById('fsa').onclick = () => attempt('showOpenFilePicker', async () => {
+  const [h] = await showOpenFilePicker();
+  const f = await h.getFile(); return f.name + ' ' + f.size + ' bytes';
+});
+document.getElementById('dir').onclick = () => attempt('showDirectoryPicker', async () => {
+  const d = await showDirectoryPicker(); const names = [];
+  for await (const [n] of d.entries()) { names.push(n); if (names.length > 5) break; }
+  return d.name + ' ' + JSON.stringify(names);
+});
+document.getElementById('fonts').onclick = () => attempt('queryLocalFonts + FontFace', async () => {
+  const fonts = await queryLocalFonts();
+  const pick = fonts.find(f => f.postscriptName === 'Arial-BoldMT') || fonts[0];
+  const ff = new FontFace('spike4font', `local("${pick.postscriptName}")`);
+  await ff.load(); document.fonts.add(ff);
+  return fonts.length + ' faces; loaded ' + pick.postscriptName + ' (' + pick.fullName + '), status ' + ff.status;
+});
+document.getElementById('f').onchange = e => attempt('ImageDecoder on picked file', async () => {
+  const f = e.target.files[0];
+  const d = new ImageDecoder({ data: await f.arrayBuffer(), type: f.type });
+  await d.tracks.ready; return d.tracks.selectedTrack.frameCount + ' frames';
+});
+</script>

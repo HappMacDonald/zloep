@@ -1,0 +1,102 @@
+<!doctype html><meta charset="utf-8"><title>spike2</title>
+<p><input type="file" id="f" accept="image/webp,image/gif,image/png">
+<button id="play" disabled>play/stop</button>
+<input type="range" id="sl" min="0" max="0" value="0" style="width:400px" disabled> <span id="st"></span></p>
+<canvas id="cv" style="max-width:640px;background:#888"></canvas>
+<pre id="out"></pre>
+<script src="common.js"></script>
+<script>
+let dec, n = 0, durs = [], starts = [], total = 0;
+const cv = $('#cv'), cx = cv.getContext('2d');
+
+async function bench(name, order) {
+  const ts = [];
+  for (const i of order) {
+    const t = performance.now();
+    const { image } = await dec.decode({ frameIndex: i });
+    ts.push(performance.now() - t); image.close();
+  }
+  log(name, stats(ts));
+}
+onFile('#f', async f => {
+  const buf = await f.arrayBuffer();
+  log('file', f.name, fmtB(f.size), f.type, 'sha256', (await sha256hex(buf)).slice(0, 16));
+  if (f.type === 'image/webp') {
+    const d = describeWebP(new Uint8Array(buf));
+    log('RIFF:', { top: d.top, flags: d.flags, canvas: d.canvas, loop: d.loop, anmfCount: d.frames.length });
+    log('first ANMF:', d.frames.slice(0, 4));
+    window.anmf = d.frames;
+  }
+  if (dec) dec.close();
+  dec = new ImageDecoder({ data: buf, type: f.type });
+  await dec.tracks.ready;
+  const tr = dec.tracks.selectedTrack; n = tr.frameCount;
+  log('track', { frameCount: n, animated: tr.animated, repetitionCount: tr.repetitionCount });
+  let t0 = performance.now(); await dec.completed; log('completed after extra', f1(performance.now() - t0), 'ms');
+
+  // forward pass: metadata
+  durs = []; const ts = []; const sizes = new Set(); let incomplete = 0, transp = 0;
+  for (let i = 0; i < n; i++) {
+    const t = performance.now();
+    const { image, complete } = await dec.decode({ frameIndex: i });
+    ts.push(performance.now() - t); if (!complete) incomplete++;
+    durs.push(image.duration); // microseconds, may be null
+    sizes.add([image.codedWidth, image.codedHeight, image.displayWidth, image.displayHeight, image.format].join('x'));
+    if (i < 3) log(' frame', i, { ts: image.timestamp, dur: image.duration, fmt: image.format, vis: [image.visibleRect.x, image.visibleRect.y, image.visibleRect.width, image.visibleRect.height] });
+    image.close();
+  }
+  log('decoded sizes/formats seen:', [...sizes], 'incomplete:', incomplete);
+  const hist = {}; durs.forEach(d => { const ms = Math.round(d / 1000); hist[ms] = (hist[ms] || 0) + 1; });
+  log('duration histogram ms:count', hist);
+  if (window.anmf && window.anmf.length === n) {
+    const mism = durs.filter((d, i) => Math.round(d / 1000) !== anmf[i].dur).length;
+    const sub = anmf.filter(a => a.w !== anmf[0].w || a.h !== anmf[0].h || a.x || a.y).length;
+    log('ANMF vs decoder: duration mismatches', mism, '| frames that are sub-rects in file:', sub,
+        '(if >0 and decoder sizes above are canvas-sized => Chrome composites for us)');
+  }
+  log('forward decode ms', stats(ts));
+  await bench('forward again (cache?)', [...Array(n).keys()]);
+  await bench('backward', [...Array(n).keys()].reverse());
+  let s = 12345; const rnd = () => (s = s * 1103515245 + 12345 & 0x7fffffff) / 0x7fffffff;
+  await bench('random x200', Array.from({ length: 200 }, () => Math.floor(rnd() * n)));
+  await bench('same frame x50', Array(50).fill(Math.floor(n / 2)));
+
+  starts = []; total = 0; for (const d of durs) { starts.push(total); total += d / 1000; }
+  cv.width = anmf?.length ? anmf[0].w : 0; // placeholder; fixed on first draw
+  $('#sl').max = n - 1; $('#sl').disabled = false; $('#play').disabled = false;
+  await show(0); log('ready: slider = latest-wins scrubbing, play = rAF clock.');
+});
+
+async function show(i) {
+  const t = performance.now();
+  const { image } = await dec.decode({ frameIndex: i });
+  if (cv.width !== image.displayWidth) { cv.width = image.displayWidth; cv.height = image.displayHeight; }
+  cx.clearRect(0, 0, cv.width, cv.height); cx.drawImage(image, 0, 0); image.close();
+  return performance.now() - t;
+}
+// scrubbing: latest-wins
+let want = 0, busy = false, lat = [];
+$('#sl').oninput = async e => {
+  want = +e.target.value; if (busy) return; busy = true;
+  let last = -1;
+  while (last !== want) { last = want; lat.push(await show(last)); }
+  busy = false; $('#st').textContent = 'scrub latency ' + JSON.stringify(stats(lat.slice(-50)));
+};
+// playback on own clock
+let playing = false;
+$('#play').onclick = () => {
+  playing = !playing; if (!playing) return;
+  const t0 = performance.now(); let shown = -1, drawn = 0, skipped = 0, behind = 0, dl = [], pending = false;
+  const tick = now => {
+    if (!playing) return;
+    const t = (now - t0) % total; let i = starts.findIndex((s, k) => t >= s && (k === n - 1 || t < starts[k + 1]));
+    if (i !== shown) {
+      if (pending) behind++;
+      else { pending = true; if (shown >= 0 && i !== (shown + 1) % n) skipped++; shown = i;
+        show(i).then(ms => { dl.push(ms); drawn++; pending = false; $('#st').textContent = `drawn ${drawn} skipped ${skipped} busy-drops ${behind} decode ${JSON.stringify(stats(dl.slice(-60)))}`; $('#sl').value = i; }); }
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+};
+</script>

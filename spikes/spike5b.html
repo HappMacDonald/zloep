@@ -1,0 +1,56 @@
+<!doctype html><meta charset="utf-8"><title>spike5b</title>
+<p>Photo: <input type="file" id="f" accept="image/*"> N <input id="n" value="16" size="3">
+<button id="run" disabled>run</button> <a id="d1" download="frame0.webp"></a> <a id="d2" download="frame0.png"></a></p>
+<pre id="out"></pre>
+<script type="module">
+import { stats, fmtB, sha256hex } from './lib/util.js';
+import { checkEnv, canvasProbe } from './lib/env.js';
+const out = document.getElementById('out');
+const log = (...a) => { out.textContent += a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') + '\n'; };
+log('env', checkEnv(), 'probe', canvasProbe(), 'cores', navigator.hardwareConcurrency);
+const W = 1920, H = 1080;
+let photo, jank = 0, last = performance.now();
+(function raf(t) { jank = Math.max(jank, t - last); last = t; requestAnimationFrame(raf); })(last);
+document.getElementById('f').onchange = async e => { photo = await createImageBitmap(e.target.files[0]); document.getElementById('run').disabled = false; };
+document.getElementById('run').onclick = () => run().catch(e => log('ERROR', e.stack || e));
+
+const enc = (c, type = 'image/webp', q = 1.0) => new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(Error('null')), type, q));
+
+async function runMain(cvs, conc) {
+  let next = 0, bytes = 0, hash0; jank = 0; const t0 = performance.now();
+  await Promise.all(Array.from({ length: conc }, async () => {
+    while (next < cvs.length) { const i = next++; const b = await enc(cvs[i]); bytes += b.size; if (i === 0) hash0 = await sha256hex(b); }
+  }));
+  return { ms: performance.now() - t0, bytes, hash0, gap: jank };
+}
+async function runWorkers(cvs, k) {
+  let next = 0, bytes = 0, hash0; jank = 0; const t0 = performance.now();
+  const ws = Array.from({ length: k }, () => new Worker('spike5b-worker.js'));
+  await Promise.all(ws.map(w => (async () => {
+    while (next < cvs.length) {
+      const i = next++; const bm = await createImageBitmap(cvs[i]);
+      const buf = await new Promise((res, rej) => { w.onmessage = e => res(e.data.buf); w.onerror = rej; w.postMessage({ bmp: bm }, [bm]); });
+      bytes += buf.byteLength; if (i === 0) hash0 = await sha256hex(buf);
+    }
+  })()));
+  ws.forEach(w => w.terminate());
+  return { ms: performance.now() - t0, bytes, hash0, gap: jank };
+}
+async function run() {
+  document.getElementById('run').disabled = true;
+  const N = +document.getElementById('n').value;
+  const cvs = [];
+  for (let i = 0; i < N; i++) {
+    const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d');
+    x.fillStyle = '#000'; x.fillRect(0, 0, W, H); x.drawImage(photo, i * 6, i * 3, W, H); cvs.push(c);
+  }
+  const b0 = await enc(cvs[0]), p0 = await enc(cvs[0], 'image/png');
+  document.getElementById('d1').href = URL.createObjectURL(b0); document.getElementById('d1').textContent = 'frame0.webp (' + fmtB(b0.size) + ')';
+  document.getElementById('d2').href = URL.createObjectURL(p0); document.getElementById('d2').textContent = ' frame0.png (' + fmtB(p0.size) + ')';
+  log('frames built:', N, ' (warm-up done)');
+  const show = (name, r) => log(name.padEnd(18), 'total', Math.round(r.ms), 'ms |', (r.ms / N).toFixed(0), 'ms/frame |', fmtB(r.bytes), '| max rAF gap', Math.round(r.gap), 'ms | frame0 hash', r.hash0.slice(0, 10));
+  for (const c of [1, 2, 4]) show('main conc=' + c, await runMain(cvs, c));
+  for (const k of [1, 2, 4, 8]) show('workers k=' + k, await runWorkers(cvs, k));
+  log('done'); document.getElementById('run').disabled = false;
+}
+</script>

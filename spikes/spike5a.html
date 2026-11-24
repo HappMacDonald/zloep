@@ -1,0 +1,51 @@
+<!doctype html><meta charset="utf-8"><title>spike5a</title>
+<p>Pick a 1080p animated webp: <input type="file" id="f" accept="image/webp"> <button id="run" disabled>run</button></p>
+<pre id="out"></pre>
+<script type="module">
+import { stats, fmtB, sleep } from './lib/util.js';
+import { describeWebP } from './lib/webp.js';
+import { checkEnv } from './lib/env.js';
+const out = document.getElementById('out');
+const log = (...a) => { out.textContent += a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') + '\n'; };
+log('env', checkEnv());
+let file, buf;
+document.getElementById('f').onchange = async e => {
+  file = e.target.files[0]; buf = await file.arrayBuffer();
+  const d = describeWebP(new Uint8Array(buf));
+  log('\n=== ' + file.name, fmtB(file.size), 'canvas', d.canvas, 'ANMF frames', d.frames.length,
+      'keyframe-ish (noBlend) frames:', d.frames.filter(f => f.noBlend).length);
+  document.getElementById('run').disabled = false;
+};
+document.getElementById('run').onclick = () => run().catch(e => log('ERROR', e.stack || e));
+
+async function newDec() {
+  const d = new ImageDecoder({ data: buf.slice(0), type: 'image/webp' });
+  await d.tracks.ready; return d;
+}
+async function t(dec, i) {
+  const t0 = performance.now(); const { image } = await dec.decode({ frameIndex: i });
+  const ms = performance.now() - t0; image.close(); return ms;
+}
+async function pass(name, dec, order) {
+  const ts = []; const slow = [];
+  for (const i of order) { const ms = await t(dec, i); ts.push(ms); if (ms > 50) slow.push(`#${i}:${Math.round(ms)}ms`); }
+  log(name, stats(ts), 'total ms', Math.round(ts.reduce((a, b) => a + b, 0)), slow.length ? 'slow>50ms: ' + slow.slice(0, 8).join(' ') : '');
+}
+async function run() {
+  document.getElementById('run').disabled = true;
+  let dec = await newDec(); const n = dec.tracks.selectedTrack.frameCount; log('frameCount', n);
+  const idx = [...Array(n).keys()];
+  log('T1 cold seek to LAST frame (ms):', Math.round(await t(dec, n - 1))); dec.close();
+  dec = await newDec();
+  log('T2 cold seek to MIDDLE frame (ms):', Math.round(await t(dec, n >> 1)));
+  await pass('T2b then backward from middle to 0', dec, idx.slice(0, (n >> 1)).reverse()); dec.close();
+  dec = await newDec();
+  await pass('T3 fresh decoder, forward full pass', dec, idx);
+  await pass('T4 immediately backward n-1..0', dec, [...idx].reverse());
+  log('   ...waiting 15 s idle (watch Task Manager) ...'); await sleep(15000);
+  const rnd = Array.from({ length: 100 }, (_, k) => (k * 37 + 11) % n);
+  await pass('T5 after idle: 100 pseudo-random seeks', dec, rnd);
+  dec.close(); log('done');
+  document.getElementById('run').disabled = false;
+}
+</script>
